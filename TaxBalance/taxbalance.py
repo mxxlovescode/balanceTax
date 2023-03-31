@@ -60,20 +60,23 @@ class ITaxBalance(ABC):
 
 
 class UFNSTaxBalance(ITaxBalance):
+    """Класс для управления налоговым балансом"""
 
     def __init__(self):
         self._tax_balance = pd.DataFrame()
 
-    def add_from_excel(self, path):
-        """Добавляет записи в баланс используя готовые методы"""
-        new_instance = self.from_excel(path)
-        self._tax_balance = pd.concat([self._tax_balance, new_instance._tax_balance], axis=0, join='outer', ignore_index=True)
-        logging.info(f'Загрузка файла завершена. В балансе содержится {len(self._tax_balance)} операций.')
-        return self
+    def get_payments(self, tax: str = None):
+        """Возвращает все платежи (движение денежных средств) по банку и приставам
+        (потом можно реализовать что будет абстрактный класс -
+         платежи для унификации обработки
 
-    @staticmethod
-    def from_excel(path):
-        """Инициализирует класс используя строитель UFNSTaxBalanceBuilder"""
+        """
+        payment_types = ['Платежный ордер', 'Инкассовое поручение', 'Платежное поручение']
+        mask = self._tax_balance['payment_type'].isin(payment_types)
+        return self._tax_balance[mask]
+
+    def add_from_excel(self, path):
+        """Добавляет в класс данные используя строитель UFNSTaxBalanceBuilder"""
         builder = UFNSTaxBalanceBuilder()
         builder.import_excel(path) \
             .clean_column_values() \
@@ -81,10 +84,12 @@ class UFNSTaxBalance(ITaxBalance):
             .identify_taxes() \
             .validate_tax_identification() \
             .import_taxes()
+        result = builder.get_result()
 
-        cls_instance = UFNSTaxBalance()
-        cls_instance._tax_balance = builder.get_result()
-        return cls_instance
+        self._tax_balance = pd.concat([self._tax_balance, result], axis=0, join='outer', ignore_index=True)
+        logging.info(f'Загрузка файла завершена. В балансе содержится {len(self._tax_balance)} операций.')
+
+        return self
 
 
 class UFNSTaxBalanceBuilder:
