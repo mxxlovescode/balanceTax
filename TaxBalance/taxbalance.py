@@ -350,6 +350,22 @@ class SberPaymentsExcelBuilder(ExcelBuilderMixin):
 
     def __init__(self):
         super().__init__()
+        self.__validation_sum = None # Контрольная сумма оборотов для финальной валидации.
+
+    def import_excel(self, filepath: str = None):
+        super().import_excel(filepath)
+        result = self._df.loc[self._df.eq('Итого оборотов').any(axis=1)]
+        for value in result:
+            # check if the value is numeric and greater than 0
+            if isinstance(value, (int, float)) and value > 0:
+                self.__validation_sum = value
+                logging.debug(f'Найдены обороты: {value}')
+        if not self.__validation_sum:
+            logging.warning('Обороты не найдены!')
+
+        return self
+
+
 
     def select_datetime_rows(self):
         """Оставляет строки содержащие дату в определенном столбца"""
@@ -359,11 +375,11 @@ class SberPaymentsExcelBuilder(ExcelBuilderMixin):
         return self
 
     def select_validated_rows(self):
-        before = len(self._result)
+        """Отбрасываем там где сумма платежа не пустая"""
         dropped = self._result[self._result['operation_sum'].isna()]
         self._result = self._result[self._result['operation_sum'].notna()]
-        logging.debug(f'Дополнительно отброшено {len(self._result) - before}')
-        logging.debug(dropped)
+        if not dropped.empty:
+            logging.debug(f'Дополнительно отброшено {dropped}')
         return self
 
     def set_types(self):
@@ -374,8 +390,26 @@ class SberPaymentsExcelBuilder(ExcelBuilderMixin):
         logging.debug('Типы полей установлены.')
         return self
 
-    def identify_decisions(self):
+    @staticmethod
+    def __find_decision(x):
+        """Находит регулярное выражение с номером решения"""
+        pattern = r'взыскании\s№\s+(\S+)\sот'
+        correct_number = re.findall(pattern, x['reason'])
+        if correct_number:
+            x['decision_number'] = correct_number
+            return x
+        else:
+            logging.warning(f'Строка не распознана: \n    {x}')
+            raise ValueError('Ошибка распознавания решения о взыскании!')
 
+    def identify_decisions(self):
+        """Определяет номера решений """
+
+        self._result['decision_number'] = -1
+        self._result = self._result.apply(lambda x: self.__find_decision(x), axis=1)
+        logging.debug(f'Решения распознаны.')
+        return self
 
     def validate_import(self):
         """Проводит необходимы проверки целостности файла"""
+        pass
