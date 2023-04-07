@@ -38,50 +38,6 @@ TAX_IDENTIFIERS = {
 }
 
 
-class ITaxBalance(ABC):
-    """Базовый класс для Хранения налогового баланса"""
-    pass
-
-
-class UFNSTaxBalance(ITaxBalance):
-    """Класс для управления налоговым балансом"""
-
-    def __init__(self):
-        self._tax_balance = pd.DataFrame()
-
-    def get_payments(self, tax: str = None):
-        """Возвращает все платежи (движение денежных средств) по банку и приставам
-        (потом можно реализовать что будет абстрактный класс -
-         платежи для унификации обработки
-
-        """
-        document_type = ['Платежный ордер', 'Инкассовое поручение', 'Платежное поручение']
-        mask = self._tax_balance['document_type'].isin(document_type)
-
-        if tax:
-            mask_tax = (self._tax_balance['tax'] == tax)
-            mask = (mask & mask_tax)
-
-        return self._tax_balance[mask]
-
-    def add_from_excel(self, path):
-        """Добавляет в класс данные используя строитель UFNSTaxBalanceBuilder"""
-        builder = UFNSTaxBalanceBuilder()
-        builder.import_excel(path) \
-            .clean_column_values() \
-            .identify_columns() \
-            .identify_taxes() \
-            .validate_tax_identification() \
-            .import_taxes()
-        result = builder.get_result()
-
-        self._tax_balance = pd.concat([self._tax_balance, result], axis=0, join='outer', ignore_index=True)
-        logging.info(f'Загрузка файла завершена. В балансе содержится {len(self._tax_balance)} операций.')
-        self._tax_balance = self._tax_balance.sort_values(by='operation_date')
-
-        return self
-
-
 class ExcelBuilderMixin:
     """Миксин с методами для импорта Excel Файлов
 
@@ -102,7 +58,7 @@ class ExcelBuilderMixin:
         return self
 
     def get_result(self):
-        logging.info(f"Успешно импортировано {len(self._result)} строк.")
+        logging.debug(f"Успешно импортировано {len(self._result)} строк.")
         return self._result
 
     def clean_column_values(self):
@@ -141,6 +97,217 @@ class ExcelBuilderMixin:
             return self
         else:
             raise NotImplementedError("Не определено COLUMN_IDENTIFIERS. Невозможно провести идентификацию.")
+
+
+class SberPaymentsExcelBuilder(ExcelBuilderMixin):
+    """Строитель для импорта платежей из Excel-файлов платежей в адрес налоговой из Сбербанка."""
+
+    COLUMN_IDENTIFIERS = {
+        'operation_date': 'Дата проводки',
+        'operation_sum': 'Сумма по дебету',
+        'document_number': '№ документа',
+        'reason': 'Назначение платежа',
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.__validation_sum = None  # Контрольная сумма оборотов для финальной валидации.
+
+    def import_excel(self, filepath: str = None):
+        super().import_excel(filepath)
+        result = self._df.loc[self._df.eq('Итого оборотов').any(axis=1)].iloc[0]
+        for value in result:
+            # check if the value is numeric and greater than 0
+            if isinstance(value, (int, float)) and value > 0:
+                self.__validation_sum = value
+                logging.debug(f'Найдены обороты: {value}')
+        if not self.__validation_sum:
+            logging.warning('Обороты не найдены!')
+
+        return self
+
+    def select_datetime_rows(self):
+        """Оставляет строки содержащие дату в определенном столбца"""
+        mask = pd.to_datetime(self._df['operation_date'], errors='coerce', dayfirst=True).notnull()
+        self._result = self._df[mask].copy().reset_index(drop=True)
+        logging.debug(f"Загружено {len(self._df)} операций из {len(self._df)} строк.")
+        return self
+
+    def select_validated_rows(self):
+        """Отбрасываем там где сумма платежа не пустая"""
+        dropped = self._result[self._result['operation_sum'].isna()]
+        self._result = self._result[self._result['operation_sum'].notna()]
+        if not dropped.empty:
+            logging.debug(f'Дополнительно отброшено {dropped}')
+        return self
+
+    def set_types(self):
+        """Определяем типы столбцов"""
+        self._result['operation_date'] = pd.to_datetime(self._result['operation_date'], dayfirst=True).dt.date
+        self._result['operation_sum'] = self._result['operation_sum'].fillna(0).astype('float64')
+        self._result['reason'] = self._result['reason'].astype('category')
+        logging.debug('Типы полей установлены.')
+        return self
+
+    def correct_document_number(self):
+        """Приводит номер документа в вид строки с 5 знаками (где не хватает, добавляет нули)."""
+
+        def fill_with_zeros(s: str) -> str:
+            if len(s) < 5:
+                return '0' * (5 - len(s)) + s
+            else:
+                return s
+
+        self._result['document_number'] = self._result['document_number'].apply(lambda x: fill_with_zeros(x))
+        return self
+
+    def identify_decisions(self):
+        """Определяет номера решений """
+
+        def __find_decision(x):
+            """Находит регулярное выражение с номером решения"""
+            pattern = r'взыскании\s№\s+(\S+)\sот'
+            correct_number = re.findall(pattern, x['reason'])
+            if correct_number:
+                x['decision_number'] = correct_number[0]
+                return x
+            else:
+                logging.warning(f'Строка не распознана: \n    {x}')
+                raise ValueError('Ошибка распознавания решения о взыскании!')
+
+        self._result['decision_number'] = -1
+        self._result = self._result.apply(lambda x: __find_decision(x), axis=1)
+        logging.debug(f'Решения распознаны.')
+        return self
+
+    def validate_import(self):
+        """Проводит необходимы проверки целостности файла
+         1) Контрольная сумма операций и сумма операций из файла
+         2) Проверяет уникальность one-to-many решений и платежных документов
+
+         """
+        check_sum = self._result['operation_sum'].sum()
+        if -1 < (check_sum - self.__validation_sum) < 1:
+            logging.debug(f'Проверка контрольных сумм импорта. Успех. \n'
+                          f'Сумма импорта: {self.__validation_sum}\n'
+                          f'Количество операций: {len(self._result)}')
+        else:
+            raise ImportError(f'Контрольные суммы импорта не совпадают. \n'
+                              f'Сумма документа: {self.__validation_sum} \nСумма импорта: {check_sum}')
+
+        # Проверяем может ли к одному платежному документу относится два решения
+        payment_docs = self._result.document_number.unique()
+        for doc in payment_docs:
+            unique_list = self._result[self._result['document_number'] == doc]['decision_number'].unique()
+            decision_count = len(unique_list)
+            if decision_count > 1:
+                logging.warning(f'Найдена проблема: документ №{doc} содержит {decision_count} решений')
+                raise ImportError(f'Один платежный документ погашает более одного решения о взыскании.')
+        logging.debug(f'Проверка на соответствие платежных документов и решений о взыскании. Успех.')
+
+        return self
+
+
+class SberPayments:
+    """Вектор платежей по расчетному счету в СБЕРБАНКЕ"""
+
+    def __init__(self):
+        self._operations = pd.DataFrame()
+
+    def map_documents_decision(self) -> dict:
+        """Строим словарь соответствий: dict(document_number -> decision_number"""
+
+        documents = self._operations.document_number.unique()
+        document_decision_map = {}
+        for doc in documents:
+            document_decision_map[doc] = self._operations[self._operations.document_number == doc].decision_number.unique()[0]
+
+        return document_decision_map
+
+    def add_from_excel(self, path):
+        """Импортирует файлы из ЭКСЕЛЬ"""
+        operations = SberPaymentsExcelBuilder() \
+            .import_excel(path) \
+            .clean_column_values() \
+            .identify_columns() \
+            .select_datetime_rows() \
+            .set_types() \
+            .select_validated_rows() \
+            .identify_decisions() \
+            .validate_import() \
+            .get_result()
+
+        self._operations = pd.concat([self._operations, operations], axis=0, join='outer', ignore_index=True) \
+            .sort_values(by='operation_date')
+        logging.info(f'Загрузка файла завершена. В платежах содержится {len(self._operations)} операций.')
+        return self
+
+    @property
+    def df(self):
+        return self._operations
+
+
+class ITaxBalance(ABC):
+    """Базовый класс для Хранения налогового баланса"""
+    pass
+
+
+class UFNSTaxBalance(ITaxBalance):
+    """Класс для управления налоговым балансом"""
+
+    def __init__(self):
+        self._tax_balance = pd.DataFrame()
+
+    @property
+    def df(self):
+        return self._tax_balance
+
+    def info(self):
+        """Короткая справка о степени идентификации операций.
+
+            * Степени идентификации доходных операций (источника, причины)."""
+        ins_balance = self._tax_balance
+        credit_val = ins_balance[ins_balance["decision_number"].notnull()]['credit'].sum()
+        credit_inv = ins_balance[ins_balance["decision_number"].isnull()]['credit'].sum()
+
+        logging.info(f'Идентификация налога, по решениям\nРазнеслось операций по кредиту: {credit_val}\n'
+                     f'Остаток: {credit_inv}')
+
+    def get_payments(self, tax: str = None):
+        """Возвращает все платежи (движение денежных средств) по банку и приставам
+        (потом можно реализовать что будет абстрактный класс -
+         платежи для унификации обработки
+
+        """
+        document_type = ['Платежный ордер', 'Инкассовое поручение', 'Платежное поручение']
+        mask = self._tax_balance['document_type'].isin(document_type)
+
+        if tax:
+            mask_tax = (self._tax_balance['tax'] == tax)
+            mask = (mask & mask_tax)
+
+        return self._tax_balance[mask]
+
+    def add_from_excel(self, path, sber: SberPayments):
+        """Добавляет в класс данные используя строитель UFNSTaxBalanceBuilder
+
+        sber - Экземпляр класса импорта банка для поиска соответствия решений
+        """
+        builder = UFNSTaxBalanceBuilder()
+        builder.import_excel(path) \
+            .clean_column_values() \
+            .identify_columns() \
+            .identify_taxes() \
+            .validate_tax_identification() \
+            .import_taxes()\
+            .set_decision_numbers(sber)
+        result = builder.get_result()
+
+        self._tax_balance = pd.concat([self._tax_balance, result], axis=0, join='outer', ignore_index=True)
+        logging.info(f'Загрузка файла завершена. В балансе содержится {len(self._tax_balance)} операций.')
+        self._tax_balance = self._tax_balance.sort_values(by='operation_date')
+
+        return self
 
 
 class UFNSTaxBalanceBuilder(ExcelBuilderMixin):
@@ -337,122 +504,43 @@ class UFNSTaxBalanceBuilder(ExcelBuilderMixin):
 
         return self
 
+    def set_decision_numbers(self, sber: SberPayments):
+        """Устанавливает номер решения по взысканию.
 
-class SberPaymentsExcelBuilder(ExcelBuilderMixin):
-    """Строитель для импорта платежей из Excel-файлов платежей в адрес налоговой из Сбербанка."""
+        На основании соответствия номера документа из СберБанка и номера документа УФНС.
+        """
+        # Пробуем найти документ из банка в УФНС и считаем сколько найдено
 
-    COLUMN_IDENTIFIERS = {
-        'operation_date': 'Дата проводки',
-        'operation_sum': 'Сумма по дебету',
-        'document_number': '№ документа',
-        'reason': 'Назначение платежа',
-    }
+        """Тут будем отслеживать все ли платежные документы нашли хотя бы одно соответствие в документе налоговой.
+        """
+        d_map = sber.map_documents_decision()
+        d_map = pd.DataFrame.from_dict(d_map, orient='index', dtype='str', columns=['decision_number'])
+        d_map.index.name = 'document_number'
+        d_map['found_count'] = 0
 
-    def __init__(self):
-        super().__init__()
-        self.__validation_sum = None # Контрольная сумма оборотов для финальной валидации.
+        updated_balance = self._result
+        updated_balance.document_number = updated_balance.document_number.replace('nan', '')
 
-    def import_excel(self, filepath: str = None):
-        super().import_excel(filepath)
-        result = self._df.loc[self._df.eq('Итого оборотов').any(axis=1)].iloc[0]
-        for value in result:
-            # check if the value is numeric and greater than 0
-            if isinstance(value, (int, float)) and value > 0:
-                self.__validation_sum = value
-                logging.debug(f'Найдены обороты: {value}')
-        if not self.__validation_sum:
-            logging.warning('Обороты не найдены!')
+        def __get_decision_number(_row):
+            """Ищем соответствие номера из налоговой и банковского, задача расставить все.
+            Значит надо отслеживать вхождение и следить сколько осталось не разнесенных документов (должны быть все, сходится суммы)
+            """
+            if _row['document_number']:
+                for document_number_bank in d_map.index.tolist():
+                    if document_number_bank in _row['document_number']:
+                        d_map.loc[document_number_bank, 'found_count'] = d_map.loc[document_number_bank]['found_count'] + 1
+                        _row['decision_number'] = d_map.loc[document_number_bank, 'decision_number']
+            return _row
 
-        return self
+        updated_balance = updated_balance.apply(lambda x: __get_decision_number(x), axis=1)
+        found = len(d_map[d_map['found_count'] > 0])
+        docs_not_in_ufns = d_map[d_map["found_count"] == 0]
 
-    def select_datetime_rows(self):
-        """Оставляет строки содержащие дату в определенном столбца"""
-        mask = pd.to_datetime(self._df['operation_date'], errors='coerce', dayfirst=True).notnull()
-        self._result = self._df[mask].copy().reset_index(drop=True)
-        logging.debug(f"Загружено {len(self._df)} операций из {len(self._df)} строк.")
-        return self
+        logging.debug(f'Found Bank Documents in UFNS Documents: \n '
+                     f' - Found{found} of {len(d_map)} with doubled {len(d_map[d_map["found_count"] > 1])}')
+        logging.debug(f'\n{docs_not_in_ufns}')
 
-    def select_validated_rows(self):
-        """Отбрасываем там где сумма платежа не пустая"""
-        dropped = self._result[self._result['operation_sum'].isna()]
-        self._result = self._result[self._result['operation_sum'].notna()]
-        if not dropped.empty:
-            logging.debug(f'Дополнительно отброшено {dropped}')
-        return self
-
-    def set_types(self):
-        """Определяем типы столбцов"""
-        self._result['operation_date'] = pd.to_datetime(self._result['operation_date'], dayfirst=True).dt.date
-        self._result['operation_sum'] = self._result['operation_sum'].fillna(0).astype('float64')
-        self._result['reason'] = self._result['reason'].astype('category')
-        logging.debug('Типы полей установлены.')
-        return self
-
-    def identify_decisions(self):
-        """Определяет номера решений """
-
-        def __find_decision(x):
-            """Находит регулярное выражение с номером решения"""
-            pattern = r'взыскании\s№\s+(\S+)\sот'
-            correct_number = re.findall(pattern, x['reason'])
-            if correct_number:
-                x['decision_number'] = correct_number[0]
-                return x
-            else:
-                logging.warning(f'Строка не распознана: \n    {x}')
-                raise ValueError('Ошибка распознавания решения о взыскании!')
-
-        self._result['decision_number'] = -1
-        self._result = self._result.apply(lambda x: __find_decision(x), axis=1)
-        logging.debug(f'Решения распознаны.')
-        return self
-
-    def validate_import(self):
-        """Проводит необходимы проверки целостности файла сравнивая """
-        check_sum = self._result['operation_sum'].sum()
-        if  -1 < (check_sum - self.__validation_sum) < 1:
-            logging.debug(f'Проверка контрольных сумм импорта. Успех. \n'
-                          f'Сумма импорта: {self.__validation_sum}\n'
-                          f'Количество операций: {len(self._result)}')
-        else:
-            raise ImportError(f'Контрольные суммы импорта не совпадают. \n'
-                              f'Сумма документа: {self.__validation_sum} \nСумма импорта: {check_sum}')
-
-        # Проверяем может ли к одному платежному документу относится два решения
-        payment_docs = self._result.document_number.unique()
-        for doc in payment_docs:
-            unique_list = self._result[self._result['document_number'] == doc]['decision_number'].unique()
-            decision_count = len(unique_list)
-            if decision_count > 1:
-                logging.warning(f'Найдена проблема: документ №{doc} содержит {decision_count} решений')
-                raise ImportError(f'Один платежный документ погашает более одного решения о взыскании.')
-        logging.debug(f'Проверка на соответствие платежных документов и решений о взыскании. Успех.')
-
-        return self
-
-
-class SberPayments:
-    """Вектор платежей по расчетному счету в СБЕРБАНКЕ"""
-    def __init__(self):
-        self._operations = pd.DataFrame()
-
-    def add_from_excel(self, path):
-        """Импортирует файлы из ЭКСЕЛЬ"""
-        operations = SberPaymentsExcelBuilder() \
-            .import_excel(path) \
-            .clean_column_values() \
-            .identify_columns() \
-            .select_datetime_rows() \
-            .set_types() \
-            .select_validated_rows() \
-            .identify_decisions() \
-            .validate_import() \
-            .get_result()
-
-        self._operations = pd.concat([self._operations, operations], axis=0, join='outer', ignore_index=True)\
-            .sort_values(by='operation_date')
-        logging.info(f'Загрузка файла завершена. В платежах содержится {len(self._operations)} операций.')
-
+        self._result = updated_balance
         return self
 
 
