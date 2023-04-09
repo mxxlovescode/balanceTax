@@ -83,13 +83,13 @@ class UFNSInsurancePaymentsValidated:
             self.list_decisions[key]['ufns_penalty_credit'] = ufns_penalty_credit
             self.list_decisions[key]['ufns_total_credit'] = ufns_penalty_credit + ufns_tax_credit
             self.list_decisions[key]['bank_ver'] = our_ver
-            self.list_decisions[key]['delta'] = self.list_decisions[key]['ufns_total_credit'] - self.list_decisions[key]['bank_ver']
-            self.list_decisions[key]['overpayment'] = self.list_decisions[key]['ufns_total_credit'] - self.list_decisions[key]['tax_report']
+            self.list_decisions[key]['delta'] = self.list_decisions[key]['ufns_total_credit'] - \
+                                                self.list_decisions[key]['bank_ver']
+            self.list_decisions[key]['overpayment'] = self.list_decisions[key]['ufns_total_credit'] - \
+                                                      self.list_decisions[key]['tax_report']
 
             logging.debug(
                 f'{key} - Разница(Н-МЫ): {ufns_penalty_credit + ufns_tax_credit - our_ver}  | Платеж: {ufns_penalty_credit + ufns_tax_credit} | Переплата: {ufns_penalty_credit + ufns_tax_credit - self.list_decisions[key]["tax_report"]}')
-
-            import json
 
         result = pd.DataFrame.from_dict(self.list_decisions, orient='index')
         return result
@@ -100,8 +100,10 @@ class UFNSModelCurrentBalance:
 
         * Принимает за ноль момент списания (31.06.2021)
         * Убирает восстановление.
+        * Убирает пени в момент восстановления
 
     """
+
     def __init__(self, ufns: UFNSTaxBalance):
         self.__ufns = ufns
         self.__tax_list = self.__ufns.df.tax.unique()  # Перечень всех налогов по которым будет выборка
@@ -124,19 +126,24 @@ class UFNSModelCurrentBalance:
             credit = df[mask].credit.sum()
 
             # Коррекция по 15%
-            cor_mask =  (df.operation_details == 'уменьшено (по декларации)')
+            cor_mask = (df.operation_details == 'уменьшено (по декларации)')
             cor_mask = cor_mask & (df.document_registered_date > pd.to_datetime('2022-07-10').date())
             credit_correction = df[mask & cor_mask]['credit'].sum()
 
+            debit_penni_291 = df[mask &
+                                 (df.operation_details == 'начислены пени (по расчету)') &
+                                 (df.operation_date == pd.to_datetime('2022-09-22').date())
+                                 ].debit.sum() # Сколько дополнительно начислили пени при восстановлении
             debit_penni = df[mask & (df.operation_details == 'начислены пени (по расчету)')].debit.sum()
             debit = df[mask].debit.sum()
 
             tax_dict[tax] = {
-                'balance': credit - debit,
+                'balance': credit - debit + debit_penni_291,
                 'credit': credit,
                 'credit_correction': credit_correction,
                 'debit': debit,
                 'debit_penni': debit_penni,
+                'debit_penni_291': debit_penni_291,
             }
             logging.debug(f'TAX: {tax} \nBalance: {credit - debit} \nC: {credit}, D:{debit} | D(Penni): {debit_penni}')
 
@@ -155,8 +162,12 @@ class UFNSView:
     unidentified_insurance_payments() -> pd.DataFrame: Список неидентифицированных платежей, которые невозможно разнести к 
         какому-либо налогу. Возможна еще прибавка к платежам.
     correction_sum() -> pd.DataFrame: Объем принятой переплаты.
-    model_balance() -> pd.DataFrame: Моделирует текущий баланс
+    model_balance() -> pd.DataFrame: Моделирует текущий баланс.
+    current_balance() -> float: Текущее сальдо по налогам (в общих чертах).
     """
+
+    COLUMNS_READABLE = ['operation_date', 'tax', 'operation_details', 'credit', 'debit', 'decision_number',
+                   'document_period', 'document_number', 'deadline']
 
     def __init__(self):
         """"Инициализируем из Excel"""
@@ -194,7 +205,8 @@ class UFNSView:
         # Выбираем во временном отрезке
         mask = mask & (balance.df['operation_date'] > pd.to_datetime('2020-12-01').date())
 
-        columns = ['operation_date', 'tax', 'operation_details', 'credit', 'debit', 'decision_number', 'document_period', 'document_number']
+        columns = ['operation_date', 'tax', 'operation_details', 'credit', 'debit', 'decision_number',
+                   'document_period', 'document_number']
         """Choosing without decision"""
         no_decision = balance.df[mask][columns]
 
@@ -204,7 +216,7 @@ class UFNSView:
         """Моделирует текущий баланс по налогам"""
         return UFNSModelCurrentBalance(self.__ufns).get_result()
 
-    def operations_by_tax(self, tax:str) -> pd.DataFrame:
+    def operations_by_tax(self, tax: str) -> pd.DataFrame:
         """Не показывает 291, и некоторые документы, пока заточен под страховые
         Во вменяемом виде
         """
@@ -215,7 +227,8 @@ class UFNSView:
         mask = mask & (df['document_number'] != 'А69-3154/2022')  # Убираем дополнительные спорные документы
         mask = mask & (df['tax'] == 'Страховые - ОМС')
 
-        cols = ['operation_date', 'credit', 'debit', 'deadline', 'document_number', 'document_type', 'operation_details', 'document_period', 'tax']
+        cols = ['operation_date', 'credit', 'debit', 'deadline', 'document_number', 'document_type',
+                'operation_details', 'document_period', 'tax']
         return df[mask][cols]
 
     def correction_sum(self) -> pd.DataFrame:
@@ -232,6 +245,25 @@ class UFNSView:
         df = df.groupby(by=['tax', 'tax_period'])['credit'].sum()
         return df.unstack()
 
+    def current_balance(self, payments: float, accrual: float) -> float:
+        """Возвращает расчетов сально с налоговой.
+
+        Алгоритм
+        Налоги[на последнее число операций.] - Берем из УФНС
+        + банковские платежи - берем сразу из базы
+        + Арест и Взыскание в Банк
+        - начисления 4, 1 квартала.
+
+        Пока в общих штрихах.
+
+        :param accrual: Сколько было начислено с 2022-11-9.
+        :param payments: Сколько было выплачено с 2022-11-9.
+        """
+        df = self.df
+        last_day_operation = df.operation_date.iloc[-1]
+        tax_balance_last_day = self.model_balance().balance.sum()
+        return tax_balance_last_day + payments - accrual
+
     @property
     def df(self):
         return self.__ufns.df
@@ -239,5 +271,3 @@ class UFNSView:
     @property
     def sber(self):
         return self.__sber.df
-
-
