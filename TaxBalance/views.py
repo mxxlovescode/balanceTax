@@ -164,10 +164,31 @@ class UFNSView:
     correction_sum() -> pd.DataFrame: Объем принятой переплаты.
     model_balance() -> pd.DataFrame: Моделирует текущий баланс.
     current_balance() -> float: Текущее сальдо по налогам (в общих чертах).
+    to_russian() - > pd.DataFrame: Переименовывает колонки на русский язык в соответствии с названием
     """
 
-    COLUMNS_READABLE = ['operation_date', 'tax', 'operation_details', 'credit', 'debit', 'decision_number',
-                   'document_period', 'document_number', 'deadline']
+    COLUMNS_READABLE = ['operation_date', 'tax', 'payment_type', 'operation_details', 'credit', 'debit',
+                        'decision_number',
+                   'document_period', 'document_number', 'deadline', ]
+
+    COLUMNS_RUSSIAN = {
+        'operation_date': 'Дата Операции',
+        'deadline': 'Срок уплаты',
+        'operation_details': 'Операция',
+        'document_registered_date': 'Документ: Дата пред. в НО',
+        'document_type': 'Документ:Тип ',
+        'document_number': 'Документ: Номер',
+        'document_date': 'Документ: Дата',
+        'document_period': 'Документ: Отч. период',
+        'payment_type': 'Вид платежа',
+        'debit': 'Дебет',
+        'credit': 'Кредит',
+        'accepted': 'Принято',
+        'balance_by_type': 'Баланс по виду платежа',
+        'balance_by_tax': 'Баланс по карточке',
+        'payed_before_deadline': 'Досрочно погашена отсроченная задолженность',
+        'tax': 'Налог'
+    }
 
     def __init__(self):
         """"Инициализируем из Excel"""
@@ -263,6 +284,9 @@ class UFNSView:
         last_day_operation = df.operation_date.iloc[-1]
         tax_balance_last_day = self.model_balance().balance.sum()
         return tax_balance_last_day + payments - accrual
+
+    def to_russian(self, df):
+        return df.rename(columns = self.COLUMNS_RUSSIAN)
 
     @property
     def df(self):
