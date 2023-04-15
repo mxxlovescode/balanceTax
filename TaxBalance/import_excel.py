@@ -1,16 +1,4 @@
-"""Модуль для построения оборотно сальдовой ведомости по налогам,
-
-Необходимо
-Возможности
-----------------------
-1) Определять сальдо на дату по версии налоговой
-2) Сравнивать оплаты по периодам с нашей версией
-
-
-------------------
-1) Определить списанные налоги (их периоды, суммы)
-2) Определить какие налоги были восстановлены
-3) Куда было зачтены суммы наших переплат
+"""Модуль для импорта Excel файлов налоговой и платежей из Сбербанка
 """
 import logging
 import re
@@ -299,7 +287,7 @@ class UFNSTaxBalance(ITaxBalance):
             .identify_columns() \
             .identify_taxes() \
             .validate_tax_identification() \
-            .import_taxes()\
+            .import_taxes() \
             .set_decision_numbers(sber)
         result = builder.get_result()
 
@@ -537,10 +525,8 @@ class UFNSTaxBalanceBuilder(ExcelBuilderMixin):
         docs_not_in_ufns = d_map[d_map["found_count"] == 0]
 
         logging.debug(f'Found Bank Documents in UFNS Documents: \n '
-                     f' - Found{found} of {len(d_map)} with doubled {len(d_map[d_map["found_count"] > 1])}')
+                      f' - Found{found} of {len(d_map)} with doubled {len(d_map[d_map["found_count"] > 1])}')
         logging.debug(f'\n{docs_not_in_ufns}')
 
         self._result = updated_balance
         return self
-
-

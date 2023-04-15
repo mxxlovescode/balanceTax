@@ -98,7 +98,10 @@ class UFNSInsurancePaymentsValidated:
                                                       self.list_decisions[key]['tax_report']
 
             logging.debug(
-                f'{key} - Разница(Н-МЫ): {ufns_penalty_credit + ufns_tax_credit - our_ver}  | Платеж: {ufns_penalty_credit + ufns_tax_credit} | Переплата: {ufns_penalty_credit + ufns_tax_credit - self.list_decisions[key]["tax_report"]}')
+                f'{key} - Разница(Н-МЫ): {ufns_penalty_credit + ufns_tax_credit - our_ver}  | Платеж:'
+                f' {ufns_penalty_credit + ufns_tax_credit} | '
+                f'Переплата:'
+                f' {ufns_penalty_credit + ufns_tax_credit - self.list_decisions[key]["tax_report"]}')
 
         result = pd.DataFrame.from_dict(self.list_decisions, orient='index')
         return result
@@ -139,10 +142,11 @@ class UFNSModelCurrentBalance:
             cor_mask = cor_mask & (df.document_registered_date > pd.to_datetime('2022-07-10').date())
             credit_correction = df[mask & cor_mask]['credit'].sum()
 
+            # Сколько дополнительно начислили пени при восстановлении
             debit_penni_291 = df[mask &
                                  (df.operation_details == 'начислены пени (по расчету)') &
                                  (df.operation_date == pd.to_datetime('2022-09-22').date())
-                                 ].debit.sum() # Сколько дополнительно начислили пени при восстановлении
+                                 ].debit.sum()
             debit_penni = df[mask & (df.operation_details == 'начислены пени (по расчету)')].debit.sum()
             debit = df[mask].debit.sum()
 
@@ -174,11 +178,12 @@ class UFNSView:
     model_balance() -> pd.DataFrame: Моделирует текущий баланс.
     current_balance() -> float: Текущее сальдо по налогам (в общих чертах).
     to_russian() - > pd.DataFrame: Переименовывает колонки на русский язык в соответствии с названием
+    operations_by_tax() -> pd.DataFrame: NOT IMPLEMENTED PROPERLY
     """
 
     COLUMNS_READABLE = ['operation_date', 'tax', 'payment_type', 'operation_details', 'credit', 'debit',
                         'decision_number',
-                   'document_period', 'document_number', 'deadline', ]
+                        'document_period', 'document_number', 'deadline', ]
 
     COLUMNS_RUSSIAN = {
         'operation_date': 'Дата Операции',
@@ -214,7 +219,7 @@ class UFNSView:
     def insurance_overpayment(self) -> pd.DataFrame:
         """Подтвержденная переплата в развернутом виде с платежами.
 
-        Не содержит неподтвержденных платежей (требуется подтвердить платежи из
+        Не содержит неподтвержденных платежей, требуется подтвердить платежи из
         unidentified_insurance_payments() - Там еще > 400 тыс.руб.
         """
         return UFNSInsurancePaymentsValidated(self.__ufns).main()
@@ -246,7 +251,7 @@ class UFNSView:
         """Моделирует текущий баланс по налогам"""
         return UFNSModelCurrentBalance(self.__ufns).get_result()
 
-    def operations_by_tax(self, tax: str) -> pd.DataFrame:
+    def operations_by_tax(self) -> pd.DataFrame:
         """Не показывает 291, и некоторые документы, пока заточен под страховые
         Во вменяемом виде
         """
@@ -289,13 +294,11 @@ class UFNSView:
         :param accrual: Сколько было начислено с 2022-11-9.
         :param payments: Сколько было выплачено с 2022-11-9.
         """
-        df = self.df
-        last_day_operation = df.operation_date.iloc[-1]
         tax_balance_last_day = self.model_balance().balance.sum()
         return tax_balance_last_day + payments - accrual
 
     def to_russian(self, df):
-        return df.rename(columns = self.COLUMNS_RUSSIAN)
+        return df.rename(columns=self.COLUMNS_RUSSIAN)
 
     @property
     def df(self):
